@@ -1,0 +1,40 @@
+version: "3.8"
+
+services:
+  aquinas-rag-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-openai}
+      - VECTOR_STORE=${VECTOR_STORE:-chroma}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LLAMA_CLOUD_API_KEY=${LLAMA_CLOUD_API_KEY}
+      - CHROMA_PERSIST_DIRECTORY=/app/chroma_db
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./.env:/app/.env:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Add Ollama service for local LLM
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    profiles:
+      - ollama
+
+volumes:
+  ollama_data:
