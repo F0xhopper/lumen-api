@@ -169,7 +169,7 @@ async def query_aquinas(request: QueryRequest):
             question=request.query,
             context_length=request.context_length
         )
-        
+        print(answer) 
         return QueryResponse(
             answer=answer,
             context_length=request.context_length

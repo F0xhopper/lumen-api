@@ -32,7 +32,7 @@ from llama_index.core import (
 from llama_index.core.node_parser import SemanticSplitterNodeParser
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.query_engine import RetrieverQueryEngine
-from llama_index.core.postprocessor import SimilarityPostprocessor
+from llama_index.core.postprocessor import SimilarityPostprocessor, LLMRerank, LongContextReorder
 from llama_index.core.schema import NodeWithScore
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
@@ -335,9 +335,10 @@ class AquinasRAGSystem:
         
     def create_query_engine(
         self,
-        similarity_top_k: int = 10,
+        similarity_top_k: int = 15,  # Increased to allow for better filtering
         response_mode: str = "compact",
-        use_metadata_filter: bool = True
+        use_metadata_filter: bool = True,
+        use_llm_rerank: bool = True
     ):
         """Create the query engine with Aquinas-specific configuration."""
         if not self.index:
@@ -349,17 +350,75 @@ class AquinasRAGSystem:
             similarity_top_k=similarity_top_k
         )
         
-        # Add postprocessor for similarity filtering
-        postprocessor = SimilarityPostprocessor(similarity_cutoff=0.7)
+        # Create postprocessors optimized for Aquinas philosophical texts
+        postprocessors = []
+        
+        # 1. Similarity filtering - remove completely irrelevant chunks
+        similarity_postprocessor = SimilarityPostprocessor(similarity_cutoff=0.3)
+        postprocessors.append(similarity_postprocessor)
+        
+        # 2. Long context reordering - important for dense philosophical texts
+        long_context_reorder = LongContextReorder()
+        postprocessors.append(long_context_reorder)
+        
+        # 3. LLM reranking - understands philosophical context and nuance
+        if use_llm_rerank:
+            llm_rerank = LLMRerank(top_n=5)
+            postprocessors.append(llm_rerank)
         
         # Create query engine
         self.query_engine = RetrieverQueryEngine.from_args(
             retriever=retriever,
-            node_postprocessors=[postprocessor],
+            node_postprocessors=postprocessors,
             response_mode=response_mode
         )
         
-        logger.info("Query engine created successfully")
+        logger.info("Query engine created successfully with advanced postprocessing")
+    
+    def create_alternative_query_engine(
+        self,
+        similarity_top_k: int = 10,
+        response_mode: str = "compact",
+        use_sentence_transformer_rerank: bool = True
+    ):
+        """
+        Create an alternative query engine using SentenceTransformerRerank for faster processing.
+        
+        This is useful when you want faster responses without LLM reranking costs.
+        """
+        if not self.index:
+            raise ValueError("Index not built. Call build_index() first.")
+            
+        # Create retriever
+        retriever = VectorIndexRetriever(
+            index=self.index,
+            similarity_top_k=similarity_top_k
+        )
+        
+        # Create postprocessors for faster processing
+        postprocessors = []
+        
+        # 1. Similarity filtering
+        similarity_postprocessor = SimilarityPostprocessor(similarity_cutoff=0.3)
+        postprocessors.append(similarity_postprocessor)
+        
+        # 2. Sentence transformer rerank (faster alternative to LLM rerank)
+        if use_sentence_transformer_rerank:
+            from llama_index.core.postprocessor import SentenceTransformerRerank
+            sentence_rerank = SentenceTransformerRerank(
+                model="cross-encoder/ms-marco-MiniLM-L-2-v2", 
+                top_n=5
+            )
+            postprocessors.append(sentence_rerank)
+        
+        # Create query engine
+        self.query_engine = RetrieverQueryEngine.from_args(
+            retriever=retriever,
+            node_postprocessors=postprocessors,
+            response_mode=response_mode
+        )
+        
+        logger.info("Alternative query engine created with SentenceTransformerRerank")
         
     def query(
         self,
