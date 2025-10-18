@@ -17,6 +17,7 @@ Features:
 
 import os
 import logging
+import time
 from typing import List, Dict, Any, Optional, Union
 from pathlib import Path
 from dataclasses import dataclass
@@ -88,6 +89,10 @@ class AquinasRAGSystem:
         """
         self.llama_cloud_api_key = llama_cloud_api_key or os.getenv("LLAMA_CLOUD_API_KEY")
         
+        # Rate limiting configuration
+        self.embed_batch_size = int(os.getenv("EMBED_BATCH_SIZE", "10"))
+        self.embed_delay = float(os.getenv("EMBED_DELAY", "0.5"))  # seconds between batches
+        
         # Initialize components
         self._setup_llm()
         self._setup_embeddings()
@@ -121,7 +126,9 @@ class AquinasRAGSystem:
         
         self.embeddings = OpenAIEmbedding(
             model="text-embedding-3-large",
-            embed_batch_size=100
+            embed_batch_size=self.embed_batch_size,
+            timeout=60.0,  # Increased timeout for slower requests
+            max_retries=3  # Add retry logic
         )
         
         # Set global embeddings
@@ -137,7 +144,7 @@ class AquinasRAGSystem:
         self.pc = Pinecone(api_key=api_key)
         
         # Create or get the index
-        index_name = os.getenv("PINECONE_INDEX_NAME", "aquinas-works")
+        index_name = os.getenv("PINECONE_INDEX_NAME", "aquinas-works-testing-page-number")
         namespace = os.getenv("PINECONE_NAMESPACE", "").strip() or None
         # Store for later checks
         self.pinecone_index_name = index_name
@@ -178,6 +185,11 @@ class AquinasRAGSystem:
         
         # Use semantic splitter for all documents
         self.semantic_parser = self.aquinas_chunker.get_semantic_splitter()
+        
+    def _rate_limit_delay(self):
+        """Add a small delay to avoid rate limiting."""
+        if self.embed_delay > 0:
+            time.sleep(self.embed_delay)
     
     def _get_existing_vector_count(self) -> int:
         """Return approximate count of existing vectors in the Pinecone index/namespace."""
@@ -265,15 +277,19 @@ class AquinasRAGSystem:
         
         for file_path in file_paths:
             try:
+                # Add rate limiting delay between file processing
+                self._rate_limit_delay()
+                
                 # Parse document using SimpleDirectoryReader
                 reader = SimpleDirectoryReader(input_files=[str(file_path)])
                 parsed_docs = reader.load_data()
                 
                 # Add basic metadata
-                for doc in parsed_docs:
+                for i,doc in enumerate(parsed_docs):
                     doc.metadata.update({
                         "file_path": str(file_path),
                         "file_name": file_path.name,
+                        "leaf_number": i + 1,
                         "source": "aquinas_works"
                     })
                     
@@ -303,6 +319,7 @@ class AquinasRAGSystem:
         # Build index with semantic chunking
         self.index = VectorStoreIndex.from_documents(
             documents,
+            show_progress=True,
             storage_context=storage_context,
             transformations=[node_parser]
         )
@@ -366,7 +383,7 @@ class AquinasRAGSystem:
             llm_rerank = LLMRerank(top_n=5)
             postprocessors.append(llm_rerank)
         
-        # Create query engine
+        # Create query engine with basic response
         self.query_engine = RetrieverQueryEngine.from_args(
             retriever=retriever,
             node_postprocessors=postprocessors,
@@ -411,7 +428,7 @@ class AquinasRAGSystem:
             )
             postprocessors.append(sentence_rerank)
         
-        # Create query engine
+        # Create query engine with basic response
         self.query_engine = RetrieverQueryEngine.from_args(
             retriever=retriever,
             node_postprocessors=postprocessors,
@@ -423,7 +440,8 @@ class AquinasRAGSystem:
     def query(
         self,
         question: str,
-        context_length: int = 4000
+        context_length: int = 4000,
+        retrieve_passages: bool = True
     ) -> str:
         """
         Query the Aquinas RAG system with sophisticated context.
@@ -431,15 +449,21 @@ class AquinasRAGSystem:
         Args:
             question: The question to ask about Aquinas
             context_length: Maximum context length
+            retrieve_passages: Whether to retrieve and include passages in the prompt
             
         Returns:
             Generated response
         """
         if not self.query_engine:
             raise ValueError("Query engine not created. Call create_query_engine() first.")
+        
+        # Retrieve passages if requested
+        retrieved_passages = None
+        if retrieve_passages:
+            retrieved_passages = self._retrieve_relevant_passages(question)
             
-        # Create Aquinas-specific prompt
-        aquinas_prompt = self._create_aquinas_prompt(question)
+        # Create Aquinas-specific prompt with retrieved passages
+        aquinas_prompt = self._create_aquinas_prompt(question, retrieved_passages)
         
         # Query the system
         response = self.query_engine.query(aquinas_prompt)
@@ -454,28 +478,300 @@ class AquinasRAGSystem:
             return "I apologize, but I couldn't find relevant information in the uploaded documents to answer your question. Please try rephrasing your question or upload more relevant documents."
         
         return str(response)
+    
+    def _get_source_priority(self, metadata: Dict[str, Any]) -> int:
+        """
+        Determine the priority level of a source based on its metadata.
         
-    def _create_aquinas_prompt(self, question: str) -> str:
-        """Create a sophisticated prompt for Aquinas queries."""
-        return f"""
-You are an expert on the works of St. Thomas Aquinas, one of the most influential theologians and philosophers in history. You have access to his complete works and can provide detailed, accurate analysis based on his texts.
+        Priority levels (lower number = higher priority):
+        1 - Aquinas's primary works (Summa Theologiae, Summa Contra Gentiles, etc.)
+        2 - Other Aquinas works (Commentaries, Disputed Questions, etc.)
+        3 - Secondary sources (commentaries, modern interpretations)
+        4 - Unknown or unclear sources
+        
+        Args:
+            metadata: Document metadata
+            
+        Returns:
+            Priority level (1-4)
+        """
+        file_name = metadata.get('file_name', '').lower()
+        source = metadata.get('source', '').lower()
+        
+        # Primary Aquinas works - highest priority
+        primary_works = [
+            'summa theologiae', 'summa contra gentiles', 'summa theologica',
+            'st', 'scg', 'de veritate', 'de potentia', 'de malo',
+            'quodlibetal questions', 'quodlibet', 'disputed questions'
+        ]
+        
+        for work in primary_works:
+            if work in file_name or work in source:
+                return 1
+        
+        # Other Aquinas works - high priority
+        aquinas_works = [
+            'aquinas', 'thomas', 'thomistic', 'commentary', 'commentaries',
+            'sentences', 'lombard', 'aristotle', 'augustine'
+        ]
+        
+        for work in aquinas_works:
+            if work in file_name or work in source:
+                return 2
+        
+        # Secondary sources - lower priority
+        secondary_indicators = [
+            'commentary', 'interpretation', 'analysis', 'study', 'introduction',
+            'guide', 'handbook', 'modern', 'contemporary', 'scholarly'
+        ]
+        
+        for indicator in secondary_indicators:
+            if indicator in file_name or indicator in source:
+                return 3
+        
+        # Unknown sources - lowest priority
+        return 4
 
-Context: You are analyzing the works of St. Thomas Aquinas, including:
-- Summa Theologiae (his most famous work)
-- Summa Contra Gentiles
-- Commentaries on Aristotle and other philosophers
-- Disputed Questions
-- Various treatises and sermons
+    def _retrieve_relevant_passages(self, question: str, top_k: int = 5) -> List[NodeWithScore]:
+        """
+        Retrieve relevant passages from the vector store for the given question.
+        Prioritizes primary sources over secondary sources.
+        
+        Args:
+            question: The question to retrieve passages for
+            top_k: Number of top passages to retrieve
+            
+        Returns:
+            List of relevant passages with scores, prioritized by source type
+        """
+        if not self.index:
+            return []
+        
+        try:
+            # Retrieve more passages initially to allow for prioritization
+            retriever = VectorIndexRetriever(
+                index=self.index,
+                similarity_top_k=top_k * 2  # Get more to allow for filtering and ranking
+            )
+            
+            # Retrieve relevant nodes
+            nodes = retriever.retrieve(question)
+            
+            # Apply similarity filtering
+            similarity_postprocessor = SimilarityPostprocessor(similarity_cutoff=0.3)
+            filtered_nodes = similarity_postprocessor.postprocess_nodes(nodes)
+            
+            # Sort by source priority, then by similarity score
+            def sort_key(node_with_score):
+                priority = self._get_source_priority(node_with_score.node.metadata)
+                score = getattr(node_with_score, 'score', 0.0)
+                # Lower priority number = higher priority, so we negate it
+                # Higher similarity score = better, so we keep it positive
+                return (-priority, score)
+            
+            # Sort by priority and score
+            sorted_nodes = sorted(filtered_nodes, key=sort_key, reverse=True)
+            
+            # Take only the top_k results
+            prioritized_nodes = sorted_nodes[:top_k]
+            
+            logger.info(f"Retrieved {len(prioritized_nodes)} relevant passages for question: {question}")
+            logger.info(f"Source priorities: {[self._get_source_priority(node.node.metadata) for node in prioritized_nodes]}")
+            
+            return prioritized_nodes
+            
+        except Exception as e:
+            logger.error(f"Error retrieving passages: {e}")
+            return []
+    
+    def get_relevant_passages(self, question: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """
+        Get relevant passages for a question without generating a full response.
+        Useful for debugging or analyzing what the system retrieves.
+        
+        Args:
+            question: The question to retrieve passages for
+            top_k: Number of top passages to retrieve
+            
+        Returns:
+            List of dictionaries containing passage information
+        """
+        passages = self._retrieve_relevant_passages(question, top_k)
+        
+        result = []
+        for i, passage in enumerate(passages, 1):
+            if hasattr(passage, 'node'):
+                node = passage.node
+                passage_info = {
+                    'rank': i,
+                    'text': node.text,
+                    'score': getattr(passage, 'score', 0.0),
+                    'source': node.metadata.get('source', f'Passage {i}'),
+                    'file_name': node.metadata.get('file_name', 'Unknown'),
+                    'author': node.metadata.get('author', ''),
+                    'title': node.metadata.get('title', ''),
+                    'link': node.metadata.get('link', ''),
+                    'page_label': node.metadata.get('page_label', ''),
+                    'metadata': node.metadata
+                }
+            else:
+                passage_info = {
+                    'rank': i,
+                    'text': str(passage),
+                    'score': 0.0,
+                    'source': f'Passage {i}',
+                    'file_name': 'Unknown',
+                    'metadata': {}
+                }
+            result.append(passage_info)
+        
+        return result
+        
+    def _create_aquinas_prompt(self, question: str, retrieved_passages: list = None) -> str:
+        """Create a sophisticated prompt for Aquinas queries with RAG integration."""
+        
+        # Build context from retrieved passages if available
+        context_section = ""
+        reference_list = ""
+        if retrieved_passages:
+            context_section = "\n\nRetrieved Context from Aquinas's Works:\n"
+            reference_list = "\n\nReferences:\n"
+            
+            # Create a list of all citation information for the AI to process
+            citation_data = []
+            
+            for passage in retrieved_passages:
+                # Handle NodeWithScore objects
+                if hasattr(passage, 'node'):
+                    node = passage.node
+                    text_content = node.text
+                    
+                    # Extract source information from metadata
+                    author = node.metadata.get('author', '')
+                    title = node.metadata.get('title', '')
+                    link = node.metadata.get('link', '')
+                    source_info = node.metadata.get('source', '')
+                    file_name = node.metadata.get('file_name', 'Unknown')
+                    page_label = node.metadata.get('page_label', '')
+                    leaf_number = node.metadata.get('leaf_number', '')
+                    
+                    # Create proper citation format with enhanced metadata
+                    citation_parts = []
+                    
+                    # Add author if available
+                    if author:
+                        citation_parts.append(author)
+                    
+                    # Add title if available
+                    if title:
+                        citation_parts.append(f'"{title}"')
+                    elif file_name != 'Unknown':
+                        citation_parts.append(f'({file_name})')
+                    
+                    # Add page information if available
+                    if page_label:
+                        citation_parts.append(f'p. {page_label}')
+                    
+                    # Add link if available, incorporating leaf number if present
+                    if link:
+                        # Check if this is an archive.org URL and if we have a leaf number
+                        if 'archive.org' in link and leaf_number:
+                            # Use leaf_number directly for the URL
+                            if 'archive.org/details/' in link:
+                                # Insert leaf number before the mode parameter
+                                if '/mode/' in link:
+                                    link_with_page = link.replace('/mode/', f'/page/n{leaf_number}/mode/')
+                                else:
+                                    # Add leaf number at the end if no mode parameter
+                                    link_with_page = f"{link}/page/n{leaf_number}/mode/2up"
+                                citation_parts.append(f'[Link: {link_with_page}]')
+                            else:
+                                citation_parts.append(f'[Link: {link}]')
+                        else:
+                            citation_parts.append(f'[Link: {link}]')
+                    
+                    # Create final citation text
+                    if citation_parts:
+                        citation_text = ', '.join(citation_parts)
+                    else:
+                        citation_text = f"{source_info}"
+                        if file_name != 'Unknown':
+                            citation_text += f" ({file_name})"
+                    
+                    citation_data.append({
+                        'text': text_content,
+                        'citation': citation_text,
+                        'page_label': page_label,
+                        'leaf_number': leaf_number,
+                        'file_name': file_name
+                    })
+                else:
+                    # Fallback for other types
+                    text_content = str(passage)
+                    citation_text = 'Passage'
+                    
+                    citation_data.append({
+                        'text': text_content,
+                        'citation': citation_text,
+                        'page_label': '',
+                        'leaf_number': '',
+                        'file_name': 'Unknown'
+                    })
+            
+            # Add all passages to context without manual numbering
+            for citation_info in citation_data:
+                context_section += f"{citation_info['citation']}:\n> {citation_info['text'].replace(chr(10), chr(10) + '> ')}\n\n"
+        
+        return f"""You are a specialized scholarly assistant with deep expertise in the complete works of St. Thomas Aquinas (1225-1274). Your responses must be grounded in his actual texts and demonstrate mastery of Thomistic thought.
 
-Question: {question}
+PRIMARY SOURCE PRIORITY:
+- ALWAYS prioritize answering the question using Aquinas's own words from the retrieved primary sources
+- When multiple sources are available, give precedence to Aquinas's direct statements
+- Distinguish clearly between Aquinas's original texts and later Thomistic tradition
+- If secondary sources are present, use them only to supplement, not replace, Aquinas's own words
+- Base your analysis primarily on Aquinas's actual texts, not on interpretations or summaries
 
-Please provide a comprehensive answer that:
-1. Directly references Aquinas's own words and arguments when possible
-2. Explains the theological and philosophical context
-3. Shows how this relates to other parts of his thought
-4. Maintains academic rigor while being accessible
-5. Cites specific works, parts, questions, and articles when relevant
-"""
+METHODOLOGY:
+- Base your analysis primarily on the retrieved passages provided below
+- Use Aquinas's own terminology and conceptual framework
+- Distinguish between what Aquinas explicitly states vs. reasonable inferences
+- Consider objections and replies in Aquinas's characteristic style
+- Show awareness of his sources (especially Aristotle, Augustine, Pseudo-Dionysius)
+
+CITATION REQUIREMENTS:
+- Use Wikipedia-style numbered citations throughout your response (e.g., [1], [2], [3])
+- Reference specific works using standard abbreviations (ST = Summa Theologiae, SCG = Summa Contra Gentiles, etc.)
+- Use precise citations (e.g., ST I, q.2, a.3; SCG II, c.15)
+- Distinguish between Aquinas's own position and positions he discusses but rejects
+- Note when paraphrasing vs. directly quoting
+- Always cite Aquinas's primary texts when available, not secondary sources
+- IMPORTANT: You must assign reference numbers [1], [2], [3], etc. based on the ORDER OF APPEARANCE in your response, not the order the sources were retrieved
+- The first source you reference in your response should be [1], the second should be [2], and so on
+- Include a numbered reference list at the end of your response that corresponds to the citation numbers you used
+- For archive.org links, the URL uses leaf numbers with 'n' prefix for navigation (e.g., /page/n162/mode/2up), but reference page labels in your response text
+
+SCHOLARLY STANDARDS:
+- Maintain academic precision while being accessible
+- Acknowledge limitations or uncertainties in interpretation
+- Note when questions go beyond what Aquinas directly addressed
+- Distinguish between historical Thomas and later Thomistic tradition when relevant
+- When secondary sources are cited, clearly indicate they are secondary and not Aquinas's own words
+
+RESPONSE STRUCTURE:
+- As a priority begin the response using Aquinas's own words from retrieved primary sources
+- Structure your response to prioritize Aquinas's direct statements
+- Use secondary sources only as supplementary support
+- Provide comprehensive analysis grounded in Aquinas's actual texts
+- Support all claims with appropriate citations from Aquinas's primary sources whenever possible, especially from the retrieved primary sources
+- If primary sources are available, they must form the core of your response
+- When quoting Aquinas directly, format the quotes using markdown block quotes (> text) for proper visual distinction
+- End your response with a "References" section containing numbered citations that correspond to the [1], [2], [3] citations used throughout your response
+- The reference numbers should be assigned based on the order you first mention each source in your response, not the retrieval order
+
+{context_section}
+QUESTION: {question}
+
+Provide a comprehensive response that demonstrates both textual fidelity to Aquinas and sophisticated theological-philosophical analysis. Structure your response clearly and support all claims with appropriate citations from Aquinas's primary sources whenever possible. Remember to assign reference numbers [1], [2], [3], etc. based on the order you first reference each source in your response, not the order they appear in the retrieved context above."""
         
     def get_metadata_summary(self) -> Dict[str, Any]:
         """Get a summary of the indexed documents' metadata."""

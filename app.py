@@ -95,6 +95,7 @@ class UploadResponse(BaseModel):
     file_names: List[str] = Field(..., description="Names of processed files")
     index_status: str = Field(..., description="Status of the index after upload")
     total_documents: int = Field(..., description="Total documents in the index")
+    metadata_added: Dict[str, Any] = Field(..., description="Metadata that was added to the documents")
 
 class StatusResponse(BaseModel):
     """Response model for system status."""
@@ -104,8 +105,8 @@ class StatusResponse(BaseModel):
     status_message: str = Field(..., description="Overall system status message")
 
 
-async def process_uploaded_file(file: UploadFile) -> List[Any]:
-    """Process an uploaded file and return documents."""
+async def process_uploaded_file(file: UploadFile, author: Optional[str] = None, title: Optional[str] = None, link: Optional[str] = None) -> List[Any]:
+    """Process an uploaded file and return documents with custom metadata."""
     # Create temporary file
     with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as temp_file:
         content = await file.read()
@@ -113,9 +114,19 @@ async def process_uploaded_file(file: UploadFile) -> List[Any]:
         temp_file_path = temp_file.name
     
     try:
-        # Process the document
+        # Prepare custom metadata
+        custom_metadata = {}
+        if author:
+            custom_metadata["author"] = author
+        if title:
+            custom_metadata["title"] = title
+        if link:
+            custom_metadata["link"] = link
+        
+        # Process the document with custom metadata
         documents = rag_system.ingest_documents(
-            documents_path=temp_file_path
+            documents_path=temp_file_path,
+            custom_metadata=custom_metadata if custom_metadata else None
         )
         return documents
     finally:
@@ -140,6 +151,7 @@ async def root():
         "endpoints": {
             "query": "/query",
             "upload": "/upload",
+            "passages": "/passages",
             "status": "/status",
             "docs": "/docs"
         }
@@ -182,13 +194,19 @@ async def query_aquinas(request: QueryRequest):
 @app.post("/upload", response_model=UploadResponse)
 async def upload_document(
     file: UploadFile = File(..., description="PDF document to upload"),
+    author: Optional[str] = Form(None, description="Author of the document"),
+    title: Optional[str] = Form(None, description="Title of the document"),
+    link: Optional[str] = Form(None, description="Link to the original document"),
 ):
     """
-    Upload a PDF document to the Aquinas RAG system.
+    Upload a PDF document to the Aquinas RAG system with optional metadata.
     
     This endpoint processes PDF documents using LlamaCloud parsing and adds them 
     to the Pinecone vector index for querying. Documents are chunked using 
     advanced strategies optimized for Aquinas's philosophical texts.
+    
+    You can optionally provide author, title, and link information that will be 
+    stored as metadata with the document for better organization and citation.
     """
     if rag_system is None:
         raise HTTPException(status_code=503, detail="RAG system not initialized")
@@ -201,8 +219,8 @@ async def upload_document(
         raise
     
     try:
-        # Process the uploaded file
-        documents = await process_uploaded_file(file)
+        # Process the uploaded file with metadata
+        documents = await process_uploaded_file(file, author, title, link)
         
         if not documents:
             raise HTTPException(status_code=400, detail="No documents could be processed from the file")
@@ -223,17 +241,54 @@ async def upload_document(
         # Get total document count (approximate)
         total_documents = len(documents) if rag_system.index is None else len(documents) + 1
         
+        # Prepare metadata information for response
+        metadata_added = {}
+        if author:
+            metadata_added["author"] = author
+        if title:
+            metadata_added["title"] = title
+        if link:
+            metadata_added["link"] = link
+        
         return UploadResponse(
             message="Document uploaded and processed successfully",
             documents_processed=len(documents),
             file_names=[file.filename],
             index_status=index_status,
-            total_documents=total_documents
+            total_documents=total_documents,
+            metadata_added=metadata_added
         )
         
     except Exception as e:
         logger.error(f"Error processing upload: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing upload: {str(e)}")
+
+@app.get("/passages", response_model=List[Dict[str, Any]])
+async def get_relevant_passages(
+    query: str = Query(..., description="Query to retrieve relevant passages for"),
+    top_k: int = Query(5, description="Number of top passages to retrieve", ge=1, le=20)
+):
+    """
+    Get relevant passages for a query without generating a full response.
+    
+    This endpoint is useful for debugging or analyzing what the system retrieves.
+    It returns passages with enhanced metadata including author, title, and link information.
+    """
+    if rag_system is None:
+        raise HTTPException(status_code=503, detail="RAG system not initialized")
+    
+    if not rag_system.query_engine:
+        try:
+            rag_system.ensure_ready_for_queries()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Query engine not ready: {str(e)}")
+    
+    try:
+        passages = rag_system.get_relevant_passages(query, top_k)
+        return passages
+    except Exception as e:
+        logger.error(f"Error retrieving passages: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving passages: {str(e)}")
 
 @app.get("/status", response_model=StatusResponse)
 async def get_system_status():
